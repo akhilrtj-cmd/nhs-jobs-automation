@@ -1,0 +1,6 @@
+node_modules/
+__pycache__/
+.env
+*.pyc
+nhs_dead_jobs_report.csv
+nhs_band3_auto_import_report.csv

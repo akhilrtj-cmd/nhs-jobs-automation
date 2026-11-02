@@ -1,0 +1,91 @@
+name: NHS dead job sweep
+
+# Aims for 00:05 UK time, just after NHS closes applications at 23:59 on each
+# closing date. GitHub cron is UTC only and does not follow daylight saving,
+# so two schedules are registered: 23:05 UTC (00:05 BST) and 00:05 UTC
+# (00:05 GMT).
+#
+# GitHub often starts scheduled runs hours late -- the existing dead-job
+# sweep, scheduled for 03:00 UTC, has been starting around 09:00 UTC. The
+# gate therefore accepts any London hour from 00 to 08 rather than only
+# midnight, so a delayed run still does its job instead of being skipped.
+# The sweep is idempotent (closed listings are retired or removed on the
+# first pass), so an extra run in the window is harmless.
+#
+# Scheduled runs only apply changes from 6 October 2026 (London) onward.
+# Before then they do nothing, which is how the first live sweep was held
+# back until the start date.
+#
+# workflow_dispatch runs at any time. Its apply input defaults to false, so a
+# manual run only reports and changes nothing unless apply is ticked.
+on:
+  schedule:
+    - cron: "5 23 * * *"
+    - cron: "5 0 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Retire/delete closed listings (off = dry run, report only)"
+        type: boolean
+        default: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Decide whether to run, and whether to apply
+        id: gate
+        run: |
+          EVENT="${{ github.event_name }}"
+          TODAY=$(TZ=Europe/London date +%F)
+          HOUR=$(TZ=Europe/London date +%H)
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "apply=${{ inputs.apply || 'false' }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$TODAY" > "2026-10-05" ]] && [ "$((10#$HOUR))" -le 8 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "apply=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "London is $TODAY $HOUR:xx -- outside the window (from 2026-10-06, 00-08). Skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "apply=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: steps.gate.outputs.run == 'true'
+        working-directory: scripts/nhs-dead-job-sweep
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright's Chromium (with OS deps)
+        if: steps.gate.outputs.run == 'true'
+        working-directory: scripts/nhs-dead-job-sweep
+        run: playwright install --with-deps chromium
+
+      - name: Run NHS closed-job sweep
+        if: steps.gate.outputs.run == 'true'
+        working-directory: scripts/nhs-dead-job-sweep
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ "${{ steps.gate.outputs.apply }}" = "true" ]; then
+            python check_nhs_closed_jobs.py --apply
+          else
+            python check_nhs_closed_jobs.py
+          fi
+
+      - name: Upload report
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nhs-dead-jobs-report
+          path: scripts/nhs-dead-job-sweep/nhs_dead_jobs_report.csv
+          retention-days: 30

@@ -1,0 +1,88 @@
+name: NHS Band 3 weekly import
+
+# Tuesday, Thursday, Saturday, 06:00 UTC. Picked deliberately away from
+# midnight: at 06:00 the UK is always either 06:00 GMT or 07:00 BST, so the
+# UK calendar day always matches the UTC day this cron fires on -- no
+# BST/GMT boundary gate needed here, unlike nhs-dead-job-sweep.yml (which
+# targets 00:05 UK time specifically, right at the boundary that's
+# sensitive to). Cron day-of-week: 2=Tue, 4=Thu, 6=Sat.
+#
+# This pipeline imports straight to the live database with nobody
+# reviewing it first -- see scripts/nhs-band3-weekly-import/
+# extract_classify_import.py's own header for the strict eligibility gate
+# and safety caps that make that acceptable unattended.
+on:
+  schedule:
+    - cron: "0 6 * * 2,4,6"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Classify only, do not import anything"
+        type: boolean
+        default: true
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Node dependencies
+        # The occupation-code backfill step below runs
+        # scripts/backfill-occupation-codes.mjs, which imports
+        # @neondatabase/serverless -- a dependency of the main Next.js app,
+        # not of this Python pipeline. Confirmed live: without this step the
+        # backfill crashed with ERR_MODULE_NOT_FOUND on every real run so
+        # far (Oct 20 and Oct 24), silently leaving every newly-imported job
+        # without an occupation code -- "silently" because the Python script
+        # only warns on that failure rather than aborting, by design, so the
+        # jobs themselves still imported correctly and the eligibility gate
+        # was never affected; only the occupation code was missing.
+        run: npm ci
+
+      - name: Install Python dependencies
+        working-directory: scripts/nhs-band3-weekly-import
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright's Chromium (with OS deps)
+        working-directory: scripts/nhs-band3-weekly-import
+        run: playwright install --with-deps chromium
+
+      - name: Stub .env for the occupation-code backfill script
+        # backfill-occupation-codes.mjs does an unguarded readFileSync of
+        # .env and crashes if the file doesn't exist -- it does not exist
+        # on this runner (.env* is gitignored, never checked out). Every
+        # real value (DATABASE_URL, OPENAI_API_KEY) still comes from the
+        # env: block below via process.env; this file only needs to exist,
+        # not contain anything -- the script's own loader skips any key
+        # that's already set in process.env.
+        run: touch .env
+
+      - name: Run NHS Band 3 extraction, classification and import
+        working-directory: scripts/nhs-band3-weekly-import
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python extract_classify_import.py --dry-run
+          else
+            python extract_classify_import.py
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nhs-band3-auto-import-report
+          path: scripts/nhs-band3-weekly-import/nhs_band3_auto_import_report.csv
+          retention-days: 30
