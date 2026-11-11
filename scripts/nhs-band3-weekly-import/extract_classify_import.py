@@ -1,7 +1,7 @@
 """
-Unattended weekly pipeline: scrapes every current NHS Jobs Band 3 vacancy,
-classifies Skilled Worker visa sponsorship eligibility, and imports the
-jobs that pass a STRICT eligibility gate straight into the live database.
+Unattended weekly pipeline: scrapes every current NHS Jobs Band 3 and Band 4
+vacancy, classifies Skilled Worker visa sponsorship eligibility, and imports
+the jobs that pass a STRICT eligibility gate straight into the live database.
 No human reviews this before it goes live -- see "Why a stricter gate than
 the manual pipeline" below for what that changes.
 
@@ -38,9 +38,11 @@ pipeline gets, after the fact rather than before.
 Safety caps, on top of the strict gate itself:
   * Dedup against the live DB by applicationUrl before importing -- a job
     already live from a previous run is never reinserted.
-  * If the search returns suspiciously few results for Band 3 (the site
+  * If the search returns suspiciously few results for a pay band (the site
     layout may have changed, or a request may be getting blocked), the run
     aborts without importing anything rather than publish from bad data.
+    Each band has its own expected-results floor in MIN_EXPECTED_RESULTS,
+    since Band 3 and Band 4 run at very different volumes.
   * If more than MAX_IMPORT_PER_RUN jobs would be imported in one run, the
     run aborts without importing -- more likely a dedup/scrape bug than a
     real surge, between runs only ~2-3 days apart.
@@ -51,8 +53,8 @@ Usage:
   python extract_classify_import.py --limit 20   # testing only -- the production
                                                    # workflow never passes this; a
                                                    # real run always covers all of
-                                                   # Band 3, since there's no
-                                                   # persisted "already seen" state
+                                                   # Band 3 and Band 4, since there's
+                                                   # no persisted "already seen" state
                                                    # between separate scheduled runs
                                                    # to resume from.
 """
@@ -70,14 +72,21 @@ from lxml import html
 from playwright.sync_api import sync_playwright
 
 SEARCH_KEYWORD = ""
-PAY_BAND = "BAND_3"
+# The site 400s on a request naming more than one payBand value, so each
+# band is searched in its own separate pass (see the scraping loop in main()).
+PAY_BANDS = ["BAND_3", "BAND_4"]
 BASE_URL = "https://www.jobs.nhs.uk"
 SEARCH_PATH = "/candidate/search/results"
 REPORT_CSV = "nhs_band3_auto_import_report.csv"
 
 MIN_DURATION_MONTHS = 8
-MIN_EXPECTED_RESULTS = 200  # Band 3 has consistently reported 700-850; well below that is suspicious
-MAX_IMPORT_PER_RUN = 250
+# Band 3 has consistently reported 700-850 results; Band 4 runs at roughly
+# half that volume. Well below either floor is suspicious (site layout
+# changed, or the request is being blocked) and aborts that band's run.
+MIN_EXPECTED_RESULTS = {"BAND_3": 200, "BAND_4": 100}
+# Raised from the Band-3-only 250 to give headroom for a combined
+# Band 3 + Band 4 run without needing a second, separate cap.
+MAX_IMPORT_PER_RUN = 300
 
 HCSW_SOC_CODE = "6131"
 
@@ -209,8 +218,8 @@ def strict_auto_import_check(job):
 
 
 # --- Scraping ----------------------------------------------------------------
-def search_results_url(page_num):
-    params = {"keyword": SEARCH_KEYWORD, "payBand": PAY_BAND, "language": "en", "page": page_num}
+def search_results_url(page_num, pay_band):
+    params = {"keyword": SEARCH_KEYWORD, "payBand": pay_band, "language": "en", "page": page_num}
     return f"{BASE_URL}{SEARCH_PATH}?{urlencode(params)}"
 
 
@@ -422,41 +431,46 @@ def main():
         )
         page = context.new_page()
 
-        page_num = 1
-        total_count = None
-        while True:
-            url = search_results_url(page_num)
-            try:
-                goto_with_retry(page, url)
-            except Exception as e:
-                print(f"ABORT: could not load Band 3 search page {page_num} after retries: {e}")
-                sys.exit(1)
-            page.wait_for_timeout(500)
-            search_html = page.content()
-            if total_count is None:
-                total_count = get_total_result_count(search_html)
-                print(f"NHS Jobs reports {total_count} Band 3 results.\n")
-                if not total_count or total_count < MIN_EXPECTED_RESULTS:
-                    print(f"ABORT: {total_count} is well below the normal range (700-850+) for Band 3. "
-                          "The site layout may have changed or this request may be blocked. "
-                          "Not importing anything from a run that can't trust its own result count.")
+        for pay_band in PAY_BANDS:
+            page_num = 1
+            total_count = None
+            while True:
+                url = search_results_url(page_num, pay_band)
+                try:
+                    goto_with_retry(page, url)
+                except Exception as e:
+                    print(f"ABORT: could not load {pay_band} search page {page_num} after retries: {e}")
                     sys.exit(1)
+                page.wait_for_timeout(500)
+                search_html = page.content()
+                if total_count is None:
+                    total_count = get_total_result_count(search_html)
+                    print(f"NHS Jobs reports {total_count} {pay_band} results.\n")
+                    min_expected = MIN_EXPECTED_RESULTS[pay_band]
+                    if not total_count or total_count < min_expected:
+                        print(f"ABORT: {total_count} is well below the normal range for {pay_band}. "
+                              "The site layout may have changed or this request may be blocked. "
+                              "Not importing anything from a run that can't trust its own result count.")
+                        sys.exit(1)
 
-            results = parse_search_results(search_html)
-            if not results:
-                break
-            for ref in results:
-                if ref not in refs:
-                    refs.append(ref)
+                results = parse_search_results(search_html)
+                if not results:
+                    break
+                for ref in results:
+                    if ref not in refs:
+                        refs.append(ref)
+                if limit is not None and len(refs) >= limit:
+                    refs = refs[:limit]
+                    break
+                page_num += 1
+                if page_num > 200:
+                    break
+                time.sleep(0.5)
+
+            print(f"Collected {len(refs)} job reference(s) so far after {pay_band} "
+                  f"({page_num - 1} page(s)).\n")
             if limit is not None and len(refs) >= limit:
-                refs = refs[:limit]
                 break
-            page_num += 1
-            if page_num > 200:
-                break
-            time.sleep(0.5)
-
-        print(f"Collected {len(refs)} Band 3 job reference(s) across {page_num - 1} page(s).\n")
 
         report_rows = []
         to_import = []

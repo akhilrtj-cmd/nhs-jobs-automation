@@ -1,4 +1,4 @@
-name: NHS Band 3 weekly import
+name: NHS Band 3 & 4 weekly import
 
 # Tuesday, Thursday, Saturday, 06:00 UTC. Picked deliberately away from
 # midnight: at 06:00 the UK is always either 06:00 GMT or 07:00 BST, so the
@@ -67,7 +67,7 @@ jobs:
         # that's already set in process.env.
         run: touch .env
 
-      - name: Run NHS Band 3 extraction, classification and import
+      - name: Run NHS Band 3 & 4 extraction, classification and import
         working-directory: scripts/nhs-band3-weekly-import
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
